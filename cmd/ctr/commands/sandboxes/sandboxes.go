@@ -36,6 +36,7 @@ var Command = &cli.Command{
 	Aliases: []string{"sandbox", "sb", "s"},
 	Usage:   "Manage sandboxes",
 	Subcommands: cli.Commands{
+		importCommand, forkCommand,
 		runCommand,
 		listCommand,
 		removeCommand,
@@ -168,21 +169,21 @@ var removeCommand = &cli.Command{
 			sandbox, err := client.LoadSandbox(ctx, id)
 			if err != nil {
 				log.G(ctx).WithError(err).Errorf("failed to load sandbox %s", id)
-				continue
+				return err
 			}
 
 			err = sandbox.Stop(ctx)
 			if err != nil {
 				log.G(ctx).WithError(err).Errorf("failed to stop sandbox %s", id)
 				if !force {
-					continue
+					return err
 				}
 			}
 
 			err = sandbox.Shutdown(ctx)
 			if err != nil {
 				log.G(ctx).WithError(err).Errorf("failed to shutdown sandbox %s", id)
-				continue
+				return err
 			}
 
 			log.G(ctx).Infof("deleted: %s", id)

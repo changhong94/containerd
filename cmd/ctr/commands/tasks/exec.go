@@ -36,6 +36,7 @@ var execCommand = &cli.Command{
 	Usage:     "Execute additional processes in an existing container",
 	ArgsUsage: "[flags] CONTAINER CMD [ARG...]",
 	Flags: []cli.Flag{
+		&cli.BoolFlag{Name: "null-io", Usage: "Run without stdin/stdout/stderr transport"},
 		&cli.StringFlag{
 			Name:  "cwd",
 			Usage: "Working directory of the new process",
@@ -126,6 +127,11 @@ var execCommand = &cli.Command{
 		logURI := cliContext.String("log-uri")
 		ioOpts := []cio.Opt{cio.WithFIFODir(fifoDir)}
 		switch {
+		case cliContext.Bool("null-io"):
+			if tty || logURI != "" || fifoDir != "" {
+				return errors.New("null-io cannot be combined with tty, log-uri or fifo-dir")
+			}
+			ioCreator = cio.NullIO
 		case tty && logURI != "":
 			return errors.New("can't use log-uri with tty")
 		case logURI != "" && fifoDir != "":

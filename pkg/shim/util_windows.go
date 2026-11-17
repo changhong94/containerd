@@ -35,7 +35,12 @@ func getSysProcAttr() *syscall.SysProcAttr {
 
 // AnonReconnectDialer returns a dialer for an existing npipe on containerd reconnection
 func AnonReconnectDialer(address string, timeout time.Duration) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return AnonReconnectDialerContext(context.Background(), address, timeout)
+}
+
+// AnonReconnectDialerContext respects the RPC caller cancellation.
+func AnonReconnectDialerContext(ctx context.Context, address string, timeout time.Duration) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	c, err := winio.DialPipeContext(ctx, address)

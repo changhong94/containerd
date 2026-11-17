@@ -11,3 +11,7 @@ releases/*.tar.gz
 releases/*.tar.gz.sha256sum
 _output/
 .vagrant/
+
+# Generated Python bytecode from research tools.
+__pycache__/
+*.pyc

@@ -31,7 +31,10 @@ type ExecIO struct {
 	id    string
 	fifos *cio.FIFOSet
 	*stdioStream
-	closer *wgCloser
+	closer      *wgCloser
+	stdinInput  io.ReadCloser
+	stdinMu     sync.Mutex
+	stdinClosed bool
 }
 
 var _ cio.IO = &ExecIO{}
@@ -94,6 +97,12 @@ func (e *ExecIO) Attach(opts AttachOptions) <-chan struct{} {
 	var stdinStreamRC io.ReadCloser
 	if e.stdin != nil && opts.Stdin != nil {
 		stdinStreamRC = cioutil.NewWrapReadCloser(opts.Stdin)
+		e.stdinMu.Lock()
+		if e.stdinClosed {
+			stdinStreamRC.Close()
+		}
+		e.stdinInput = stdinStreamRC
+		e.stdinMu.Unlock()
 		wg.Add(1)
 		go func() {
 			if _, err := io.Copy(e.stdin, stdinStreamRC); err != nil {
@@ -123,9 +132,6 @@ func (e *ExecIO) Attach(opts AttachOptions) <-chan struct{} {
 		}
 		out.Close()
 		stream.Close()
-		if stdinStreamRC != nil {
-			stdinStreamRC.Close()
-		}
 		e.closer.wg.Done()
 		wg.Done()
 		log.L.Debugf("Finish piping %q of container exec %q", t, e.id)
@@ -153,8 +159,20 @@ func (e *ExecIO) Attach(opts AttachOptions) <-chan struct{} {
 	return done
 }
 
+// CloseStdinInput stops forwarding input once the exec process has exited.
+// An individual output EOF does not imply that the process stopped reading stdin.
+func (e *ExecIO) CloseStdinInput() {
+	e.stdinMu.Lock()
+	defer e.stdinMu.Unlock()
+	e.stdinClosed = true
+	if e.stdinInput != nil {
+		e.stdinInput.Close()
+	}
+}
+
 // Cancel cancels exec io.
 func (e *ExecIO) Cancel() {
+	e.CloseStdinInput()
 	e.closer.Cancel()
 }
 
@@ -165,6 +183,7 @@ func (e *ExecIO) Wait() {
 
 // Close closes all FIFOs.
 func (e *ExecIO) Close() error {
+	e.CloseStdinInput()
 	if e.closer != nil {
 		e.closer.Close()
 	}

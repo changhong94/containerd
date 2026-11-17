@@ -50,6 +50,12 @@ func init() {
 // the sandbox is in ready state.
 func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandboxRequest) (_ *runtime.RunPodSandboxResponse, retErr error) {
 	config := r.GetConfig()
+	if config.GetAnnotations()[forkPlan] != "" {
+		return nil, errors.New("fork plan is an internal runtime annotation")
+	}
+	if config.GetAnnotations()[forkSource] != "" {
+		return c.runForkPod(ctx, r)
+	}
 	log.G(ctx).Debugf("Sandbox config %+v", config)
 
 	// Generate unique id and name for the sandbox and reserve the name.
