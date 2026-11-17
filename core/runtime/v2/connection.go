@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -45,7 +46,11 @@ func makeConnection(ctx context.Context, id string, params shimclient.BootstrapP
 
 	switch strings.ToLower(params.Protocol) {
 	case "ttrpc":
-		conn, err := shimclient.Connect(params.Address, shimclient.AnonReconnectDialer)
+		started := time.Now()
+		conn, err := shimclient.AnonReconnectDialerContext(ctx, params.Address, 100*time.Second)
+		if os.Getenv("KUASAR_RPC_TIMING") == "1" {
+			log.G(ctx).WithField("milliseconds", time.Since(started).Seconds()*1000).WithField("error", err).Info("fork timing: connect")
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TTRPC connection: %w", err)
 		}

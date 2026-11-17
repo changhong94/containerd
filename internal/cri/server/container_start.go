@@ -49,6 +49,14 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 		return nil, fmt.Errorf("get container info: %w", err)
 	}
 
+	spec, err := cntr.Container.Spec(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if spec.Annotations["io.kuasar.fork.guest-id"] != "" {
+		return c.startForkContainer(ctx, cntr)
+	}
+
 	id := cntr.ID
 	meta := cntr.Metadata
 	container := cntr.Container

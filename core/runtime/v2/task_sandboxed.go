@@ -18,12 +18,14 @@ package v2
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/containerd/containerd/api/runtime/task/v3"
 	"github.com/containerd/containerd/api/types"
@@ -46,6 +48,8 @@ import (
 const (
 	// TasksKey is the key used for storing tasks information in the sandbox extensions
 	TasksKey = "tasks"
+	// Negotiated controller-owned inventory for live exec processes.
+	runtimeTasksInfo = "io.kuasar.runtime-tasks.v1"
 )
 
 func init() {
@@ -58,6 +62,7 @@ type SandboxedTaskManager struct {
 	sandboxStore       sandbox.Store
 	sandboxControllers map[string]sandbox.Controller
 	tasks              *runtime.NSMap[*sandboxedTask]
+	sandboxLocks       sync.Map
 }
 
 func NewSandboxedTaskManager(ic *plugin.InitContext) (*SandboxedTaskManager, error) {
@@ -127,11 +132,21 @@ func (s *SandboxedTaskManager) Create(ctx context.Context, taskID string, bundle
 	if err != nil {
 		return nil, fmt.Errorf("failed to new sandboxed task: %w", err)
 	}
-	err = sandboxedTask.Create(ctx, bundle.Path, opts)
+	var spec oci.Spec
+	if err := typeurl.UnmarshalTo(opts.Spec, &spec); err != nil {
+		return nil, err
+	}
+	if spec.Annotations["io.kuasar.fork.adopt"] == "true" {
+		err = sandboxedTask.adopt(ctx, opts)
+	} else {
+		err = sandboxedTask.Create(ctx, bundle.Path, opts)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sandboxed task: %w", err)
 	}
-	s.tasks.Add(ctx, sandboxedTask)
+	if err := s.tasks.Add(ctx, sandboxedTask); err != nil {
+		return nil, err
+	}
 	return sandboxedTask, nil
 }
 
@@ -181,12 +196,23 @@ func (s *SandboxedTaskManager) Delete(ctx context.Context, taskID string) (*runt
 	})
 	if taskErr != nil {
 		log.G(ctx).WithField("id", taskID).WithError(taskErr).Debug("failed to delete task")
+		// A reset during VM fork is not proof that the guest task was deleted.
+		if _, liveFork := st.client.(*sandboxTaskClient); liveFork && errors.Is(taskErr, ttrpc.ErrClosed) {
+			return nil, taskErr
+		}
 		if !errors.Is(taskErr, ttrpc.ErrClosed) {
 			taskErr = errdefs.FromGRPC(taskErr)
 			if !errdefs.IsNotFound(taskErr) {
 				return nil, taskErr
 			}
 		}
+	}
+
+	if err := st.sandboxHandle.UpdateTasksExtension(ctx, func(ts *Tasks) error {
+		ts.removeTask(st.guestID())
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	if err := st.bundle.Delete(); err != nil {
@@ -225,7 +251,13 @@ func (s *SandboxedTaskManager) loadSandbox(ctx context.Context, sandboxID string
 	if !ok {
 		return nil, fmt.Errorf("can not find sandbox controller by %s", sb.Sandboxer)
 	}
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lock, _ := s.sandboxLocks.LoadOrStore(ns+"/"+sandboxID, &sync.Mutex{})
 	return &sandboxClient{
+		mu:         lock.(*sync.Mutex),
 		id:         sandboxID,
 		store:      s.sandboxStore,
 		controller: sbController,
@@ -253,6 +285,21 @@ func newSandboxedTask(
 	if err != nil {
 		return nil, err
 	}
+	// A VM fork resets vsock streams. Use fresh connections per RPC instead
+	// of retaining a dead client or replaying a possibly completed mutation.
+	if strings.HasPrefix(params.Address, "hvsock://") {
+		sandboxHandle.runtimeTasks = true
+		conn.Close()
+		var spec oci.Spec
+		raw, err := os.ReadFile(filepath.Join(bundle.Path, "config.json"))
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(raw, &spec); err != nil {
+			return nil, err
+		}
+		taskClient = &sandboxTaskClient{id: taskID, guestID: spec.Annotations["io.kuasar.fork.guest-id"], params: params}
+	}
 	t := &sandboxedTask{
 		namespace:     ns,
 		sandboxHandle: sandboxHandle,
@@ -275,10 +322,11 @@ type sandboxedTask struct {
 }
 
 type sandboxClient struct {
-	id         string
-	store      sandbox.Store
-	controller sandbox.Controller
-	mu         sync.Mutex
+	runtimeTasks bool
+	id           string
+	store        sandbox.Store
+	controller   sandbox.Controller
+	mu           *sync.Mutex
 }
 
 func (s *sandboxedTask) ID() string {
@@ -287,6 +335,13 @@ func (s *sandboxedTask) ID() string {
 
 func (s *sandboxedTask) Namespace() string {
 	return s.namespace
+}
+
+func (s *sandboxedTask) guestID() string {
+	if client, ok := s.client.(*sandboxTaskClient); ok && client.guestID != "" {
+		return client.guestID
+	}
+	return s.id
 }
 
 // Create wrap the Create API call of task with update of the sandbox extension
@@ -306,7 +361,7 @@ func (s *sandboxedTask) Create(ctx context.Context, bundle string, opts runtime.
 			})
 		}
 		ts.addTask(Task{
-			TaskID:    s.id,
+			TaskID:    s.guestID(),
 			Spec:      &spec,
 			Rootfs:    rootfs,
 			Stdin:     opts.IO.Stdin,
@@ -322,7 +377,7 @@ func (s *sandboxedTask) Create(ctx context.Context, bundle string, opts runtime.
 	if err := s.remoteTask.Create(ctx, s.bundle.Path, opts); err != nil {
 		// if it is error, we need to roll back the change of sandbox
 		if e := s.sandboxHandle.UpdateTasksExtension(ctx, func(ts *Tasks) error {
-			ts.removeTask(s.id)
+			ts.removeTask(s.guestID())
 			return nil
 		}); e != nil {
 			log.G(ctx).Warnf("failed to rollback task extension %s in sandbox %s: %v", s.ID(), s.sandboxHandle.id, e)
@@ -334,8 +389,8 @@ func (s *sandboxedTask) Create(ctx context.Context, bundle string, opts runtime.
 
 // Exec wrap the Exec API call with update of the sandbox extension
 func (s *sandboxedTask) Exec(ctx context.Context, id string, opts runtime.ExecOpts) (runtime.ExecProcess, error) {
-	if err := s.sandboxHandle.UpdateTasksExtension(ctx, func(ts *Tasks) error {
-		return ts.updateTask(s.id, func(t *Task) error {
+	if err := s.sandboxHandle.updateProcessesExtension(ctx, func(ts *Tasks) error {
+		return ts.updateTask(s.guestID(), func(t *Task) error {
 			var spec specs.Process
 			if err := typeurl.UnmarshalTo(opts.Spec, &spec); err != nil {
 				return err
@@ -355,8 +410,8 @@ func (s *sandboxedTask) Exec(ctx context.Context, id string, opts runtime.ExecOp
 
 	p, err := s.remoteTask.Exec(ctx, id, opts)
 	if err != nil {
-		if removeErr := s.sandboxHandle.UpdateTasksExtension(ctx, func(ts *Tasks) error {
-			return ts.updateTask(s.id, func(t *Task) error {
+		if removeErr := s.sandboxHandle.updateProcessesExtension(ctx, func(ts *Tasks) error {
+			return ts.updateTask(s.guestID(), func(t *Task) error {
 				t.removeProcess(id)
 				return nil
 			})
@@ -371,6 +426,45 @@ func (s *sandboxedTask) Exec(ctx context.Context, id string, opts runtime.ExecOp
 	}, nil
 }
 
+// Process also wraps inherited exec processes, which never went through Exec here.
+func (s *sandboxedTask) Process(ctx context.Context, id string) (runtime.ExecProcess, error) {
+	p, err := s.remoteTask.Process(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &sandboxedProcess{ExecProcess: p, task: s}, nil
+}
+
+// adopt registers an existing guest Task without Create/Start or checkpoint IO.
+func (s *sandboxedTask) adopt(ctx context.Context, opts runtime.CreateOpts) error {
+	sb, err := s.sandboxHandle.store.Get(ctx, s.sandboxHandle.id)
+	if err != nil {
+		return err
+	}
+	if sb.Labels["io.kuasar.containerd.namespace"] != s.namespace {
+		return fmt.Errorf("sandbox is not bound to namespace %s: %w", s.namespace, errdefs.ErrFailedPrecondition)
+	}
+	status, err := s.sandboxHandle.controller.Status(ctx, sb.ID, false)
+	if err != nil {
+		return err
+	}
+	if status.Address != opts.Address {
+		return fmt.Errorf("adoption endpoint does not match sandbox: %w", errdefs.ErrInvalidArgument)
+	}
+	if len(opts.Rootfs) != 0 || opts.IO.Terminal || opts.IO.Stdin != "" || opts.IO.Stdout != "" || opts.IO.Stderr != "" {
+		return fmt.Errorf("adoption requires inherited rootfs and empty IO: %w", errdefs.ErrInvalidArgument)
+	}
+	var inventory Tasks
+	if err := sb.GetExtension(TasksKey, &inventory); err != nil {
+		return err
+	}
+	if inventory.findTaskByID(s.guestID()) < 0 {
+		return fmt.Errorf("task absent from inherited inventory: %w", errdefs.ErrNotFound)
+	}
+	_, err = s.remoteTask.State(ctx)
+	return err
+}
+
 // sandboxedProcess wrapped exec process that is running in a sandbox.
 type sandboxedProcess struct {
 	runtime.ExecProcess
@@ -380,11 +474,11 @@ type sandboxedProcess struct {
 // Delete wrap the Delete of the process with sandbox update
 func (p *sandboxedProcess) Delete(ctx context.Context) (*runtime.Exit, error) {
 	exit, err := p.ExecProcess.Delete(ctx)
-	if err != nil && errdefs.IsNotFound(err) {
+	if err != nil && !errdefs.IsNotFound(err) {
 		return nil, err
 	}
-	err = p.task.sandboxHandle.UpdateTasksExtension(ctx, func(ts *Tasks) error {
-		return ts.updateTask(p.task.id, func(t *Task) error {
+	err = p.task.sandboxHandle.updateProcessesExtension(ctx, func(ts *Tasks) error {
+		return ts.updateTask(p.task.guestID(), func(t *Task) error {
 			t.removeProcess(p.ID())
 			return nil
 		})
@@ -395,18 +489,62 @@ func (p *sandboxedProcess) Delete(ctx context.Context) (*runtime.Exit, error) {
 	return exit, nil
 }
 
+func traceTaskUpdate(ctx context.Context, phase string, started time.Time) {
+	if os.Getenv("KUASAR_RPC_TIMING") == "1" {
+		log.G(ctx).WithField("phase", phase).WithField("milliseconds", time.Since(started).Seconds()*1000).Info("fork timing: task metadata")
+	}
+}
+
 // UpdateTasksExtension update the extension of sandbox with the key "tasks"
 func (s *sandboxClient) UpdateTasksExtension(ctx context.Context, update func(ts *Tasks) error) error {
+	return s.updateTasksExtension(ctx, update, false)
+}
+
+// Exec processes are runtime state, owned by the negotiated controller. Query
+// that owner on every mutation, including after containerd restarts, instead of
+// maintaining a second synchronous Bolt copy of every short-lived command.
+// Container definitions and sandbox bindings still use the durable store.
+func (s *sandboxClient) updateProcessesExtension(ctx context.Context, update func(ts *Tasks) error) error {
+	return s.updateTasksExtension(ctx, update, true)
+}
+
+func (s *sandboxClient) updateTasksExtension(ctx context.Context, update func(ts *Tasks) error, processOnly bool) error {
+	started := time.Now()
 	s.mu.Lock()
+	traceTaskUpdate(ctx, "lock", started)
 	defer s.mu.Unlock()
 	var tasks Tasks
+	started = time.Now()
 	sb, err := s.store.Get(ctx, s.id)
+	traceTaskUpdate(ctx, "load", started)
 	if err != nil {
 		return err
+	}
+	old := sb
+	old.Extensions = make(map[string]typeurl.Any, len(sb.Extensions))
+	for key, value := range sb.Extensions {
+		old.Extensions[key] = value
 	}
 	err = sb.GetExtension(TasksKey, &tasks)
 	if err != nil && !errdefs.IsNotFound(err) {
 		return err
+	}
+	runtimeOwned := false
+	if s.runtimeTasks {
+		status, statusErr := s.controller.Status(ctx, s.id, true)
+		if statusErr != nil {
+			return statusErr
+		}
+		if raw, ok := status.Info[runtimeTasksInfo]; ok {
+			// A fresh value avoids losing concurrent tasks when a later container
+			// mutation persists its structural inventory. Invalid data fails closed.
+			var current Tasks
+			if err := json.Unmarshal([]byte(raw), &current); err != nil {
+				return fmt.Errorf("invalid runtime task inventory: %w", err)
+			}
+			tasks = current
+			runtimeOwned = true
+		}
 	}
 	if err = update(&tasks); err != nil {
 		return err
@@ -414,11 +552,22 @@ func (s *sandboxClient) UpdateTasksExtension(ctx context.Context, update func(ts
 	if err = sb.AddExtension(TasksKey, &tasks); err != nil {
 		return err
 	}
-	old, err := s.store.Update(ctx, sb, "extensions."+TasksKey)
+	if processOnly && runtimeOwned {
+		started = time.Now()
+		err = s.controller.Update(ctx, sb.ID, sb, "extensions."+TasksKey)
+		traceTaskUpdate(ctx, "runtime_controller", started)
+		return err
+	}
+	started = time.Now()
+	_, err = s.store.Update(ctx, sb, "extensions."+TasksKey)
+	traceTaskUpdate(ctx, "persist", started)
 	if err != nil {
 		return err
 	}
-	if err := s.controller.Update(ctx, sb.ID, sb, "extensions."+TasksKey); err != nil {
+	started = time.Now()
+	err = s.controller.Update(ctx, sb.ID, sb, "extensions."+TasksKey)
+	traceTaskUpdate(ctx, "controller", started)
+	if err != nil {
 		// Rollback the change in sandbox store if controller update failed
 		if _, err := s.store.Update(ctx, old, "extensions."+TasksKey); err != nil {
 			log.G(ctx).Warnf("failed to rollback when update tasks of sandbox %s extensions: %v", s.id, err)

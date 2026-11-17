@@ -46,6 +46,7 @@ func init() {
 			plugins.PodSandboxPlugin,
 			plugins.SandboxControllerPlugin,
 			plugins.EventPlugin,
+			plugins.SandboxStorePlugin,
 		},
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
 			sc := make(map[string]sandbox.Controller)
@@ -71,7 +72,12 @@ func init() {
 				return nil, err
 			}
 
+			store, err := ic.GetByID(plugins.SandboxStorePlugin, "local")
+			if err != nil {
+				return nil, err
+			}
 			return &controllerService{
+				store:     store.(sandbox.Store),
 				sc:        sc,
 				publisher: ep.(events.Publisher),
 			}, nil
@@ -80,6 +86,7 @@ func init() {
 }
 
 type controllerService struct {
+	store     sandbox.Store
 	sc        map[string]sandbox.Controller
 	publisher events.Publisher
 	api.UnimplementedControllerServer
@@ -100,6 +107,18 @@ func (s *controllerService) getController(name string) (sandbox.Controller, erro
 		return ctrl, nil
 	}
 	return nil, fmt.Errorf("%w: failed to get sandbox controller by %s", errdefs.ErrNotFound, name)
+}
+
+// Resolve the namespace-scoped record before forwarding a global sandbox ID.
+func (s *controllerService) controllerForSandbox(ctx context.Context, name, id string) (sandbox.Controller, error) {
+	sb, err := s.store.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if sb.Sandboxer != name {
+		return nil, fmt.Errorf("sandbox controller mismatch: %w", errdefs.ErrNotFound)
+	}
+	return s.getController(name)
 }
 
 func (s *controllerService) Create(ctx context.Context, req *api.ControllerCreateRequest) (*api.ControllerCreateResponse, error) {
@@ -133,7 +152,7 @@ func (s *controllerService) Create(ctx context.Context, req *api.ControllerCreat
 
 func (s *controllerService) Start(ctx context.Context, req *api.ControllerStartRequest) (*api.ControllerStartResponse, error) {
 	log.G(ctx).WithField("req", req).Debug("start sandbox")
-	ctrl, err := s.getController(req.Sandboxer)
+	ctrl, err := s.controllerForSandbox(ctx, req.Sandboxer, req.GetSandboxID())
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
@@ -158,7 +177,7 @@ func (s *controllerService) Start(ctx context.Context, req *api.ControllerStartR
 
 func (s *controllerService) Stop(ctx context.Context, req *api.ControllerStopRequest) (*api.ControllerStopResponse, error) {
 	log.G(ctx).WithField("req", req).Debug("delete sandbox")
-	ctrl, err := s.getController(req.Sandboxer)
+	ctrl, err := s.controllerForSandbox(ctx, req.Sandboxer, req.GetSandboxID())
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
@@ -167,7 +186,7 @@ func (s *controllerService) Stop(ctx context.Context, req *api.ControllerStopReq
 
 func (s *controllerService) Wait(ctx context.Context, req *api.ControllerWaitRequest) (*api.ControllerWaitResponse, error) {
 	log.G(ctx).WithField("req", req).Debug("wait sandbox")
-	ctrl, err := s.getController(req.Sandboxer)
+	ctrl, err := s.controllerForSandbox(ctx, req.Sandboxer, req.GetSandboxID())
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
@@ -192,7 +211,7 @@ func (s *controllerService) Wait(ctx context.Context, req *api.ControllerWaitReq
 
 func (s *controllerService) Status(ctx context.Context, req *api.ControllerStatusRequest) (*api.ControllerStatusResponse, error) {
 	log.G(ctx).WithField("req", req).Debug("sandbox status")
-	ctrl, err := s.getController(req.Sandboxer)
+	ctrl, err := s.controllerForSandbox(ctx, req.Sandboxer, req.GetSandboxID())
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
@@ -209,6 +228,8 @@ func (s *controllerService) Status(ctx context.Context, req *api.ControllerStatu
 	}
 	return &api.ControllerStatusResponse{
 		SandboxID: cstatus.SandboxID,
+		Address:   cstatus.Address,
+		Version:   cstatus.Version,
 		Pid:       cstatus.Pid,
 		State:     cstatus.State,
 		Info:      cstatus.Info,
@@ -220,7 +241,7 @@ func (s *controllerService) Status(ctx context.Context, req *api.ControllerStatu
 
 func (s *controllerService) Shutdown(ctx context.Context, req *api.ControllerShutdownRequest) (*api.ControllerShutdownResponse, error) {
 	log.G(ctx).WithField("req", req).Debug("shutdown sandbox")
-	ctrl, err := s.getController(req.Sandboxer)
+	ctrl, err := s.controllerForSandbox(ctx, req.Sandboxer, req.GetSandboxID())
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
@@ -229,7 +250,7 @@ func (s *controllerService) Shutdown(ctx context.Context, req *api.ControllerShu
 
 func (s *controllerService) Metrics(ctx context.Context, req *api.ControllerMetricsRequest) (*api.ControllerMetricsResponse, error) {
 	log.G(ctx).WithField("req", req).Debug("sandbox metrics")
-	ctrl, err := s.getController(req.Sandboxer)
+	ctrl, err := s.controllerForSandbox(ctx, req.Sandboxer, req.GetSandboxID())
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
@@ -246,7 +267,7 @@ func (s *controllerService) Update(
 	ctx context.Context,
 	req *api.ControllerUpdateRequest) (*api.ControllerUpdateResponse, error) {
 	log.G(ctx).WithField("req", req).Debug("sandbox update resource")
-	ctrl, err := s.getController(req.Sandboxer)
+	ctrl, err := s.controllerForSandbox(ctx, req.Sandboxer, req.GetSandboxID())
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}

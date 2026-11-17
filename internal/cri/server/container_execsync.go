@@ -236,6 +236,7 @@ func (c *criService) execInternal(ctx context.Context, container containerd.Cont
 		}
 		// Wait for the process to be killed.
 		exitRes := <-exitCh
+		execIO.CloseStdinInput()
 		log.G(ctx).Debugf("Timeout received while waiting for exec process kill %q code %d and error %v",
 			execID, exitRes.ExitCode(), exitRes.Error())
 
@@ -245,6 +246,7 @@ func (c *criService) execInternal(ctx context.Context, container containerd.Cont
 
 		return nil, fmt.Errorf("timeout %v exceeded: %w", opts.timeout, execCtx.Err())
 	case exitRes := <-exitCh:
+		execIO.CloseStdinInput()
 		code, _, err := exitRes.Result()
 		log.G(ctx).Debugf("Exec process %q exits with exit code %d and error %v", execID, code, err)
 		if err != nil {

@@ -63,6 +63,10 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		return nil, fmt.Errorf("failed to find sandbox id %q: %w", r.GetPodSandboxId(), err)
 	}
 
+	if sandbox.Config.GetAnnotations()[forkPlan] != "" {
+		return c.createForkContainer(ctx, r, sandbox)
+	}
+
 	cstatus, err := c.sandboxService.SandboxStatus(ctx, sandbox.Sandboxer, sandbox.ID, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get controller status: %w", err)

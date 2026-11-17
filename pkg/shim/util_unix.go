@@ -91,18 +91,40 @@ func SocketAddress(ctx context.Context, socketPath, id string, debug bool) (stri
 
 // AnonDialer returns a dialer for a socket
 func AnonDialer(address string, timeout time.Duration) (net.Conn, error) {
+	return AnonReconnectDialerContext(context.Background(), address, timeout)
+}
+
+// AnonReconnectDialerContext bounds Unix connection establishment and hybrid
+// vsock handshake recovery by the RPC caller cancellation/deadline. Native
+// AF_VSOCK retains its existing dial behavior.
+func AnonReconnectDialerContext(ctx context.Context, address string, timeout time.Duration) (net.Conn, error) {
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	defer cancel()
 	proto, addr, ok := strings.Cut(address, "://")
-	if !ok {
-		return net.DialTimeout("unix", socket(address).path(), timeout)
+	if !ok || proto == protoUnix {
+		return (&net.Dialer{}).DialContext(ctx, "unix", socket(address).path())
 	}
 	switch proto {
 	case protoVsock:
-		// vsock dialer can not set timeout
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return dialVsock(addr)
 	case protoHybridVsock:
-		return dialHybridVsock(addr, timeout)
-	case protoUnix:
-		return net.DialTimeout("unix", socket(address).path(), timeout)
+		path, portString, ok := strings.Cut(addr, ":")
+		if !ok {
+			return nil, fmt.Errorf("invalid hybrid vsock address %s", addr)
+		}
+		port, err := strconv.ParseUint(portString, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid hybrid vsock port: %w", err)
+		}
+		return hybridVsockDialerContext(ctx, path, port)
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", proto)
 	}
@@ -200,51 +222,65 @@ func CanConnect(address string) bool {
 }
 
 func hybridVsockDialer(addr string, port uint64, timeout time.Duration) (net.Conn, error) {
-	timeoutCh := time.After(timeout)
-	// Do 10 retries before timeout
-	retryInterval := timeout / 10
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return hybridVsockDialerContext(ctx, addr, port)
+}
+
+func hybridVsockDialerContext(ctx context.Context, addr string, port uint64) (net.Conn, error) {
+	retry := 10 * time.Millisecond
 	for {
-		conn, err := net.DialTimeout("unix", addr, timeout)
+		conn, err := (&net.Dialer{}).DialContext(ctx, "unix", addr)
 		if err != nil {
 			return nil, err
 		}
-		if _, err = conn.Write([]byte(fmt.Sprintf("CONNECT %d\n", port))); err != nil {
+		// A canceled RPC must also interrupt a peer that never answers CONNECT.
+		stop := context.AfterFunc(ctx, func() { conn.Close() })
+		if deadline, ok := ctx.Deadline(); ok {
+			conn.SetDeadline(deadline)
+		}
+		_, err = fmt.Fprintf(conn, "CONNECT %d\n", port)
+		if err == nil {
+			var response string
+			response, err = bufio.NewReader(conn).ReadString('\n')
+			if err == nil && !strings.HasPrefix(response, "OK ") {
+				err = fmt.Errorf("hybrid vsock handshake response error: %s", response)
+			}
+		}
+		stopped := stop()
+		if ctx.Err() != nil || !stopped {
 			conn.Close()
+			return nil, ctx.Err()
+		}
+		if err == nil {
+			conn.SetDeadline(time.Time{})
+			return conn, nil
+		}
+		conn.Close()
+		if !errors.Is(err, io.EOF) {
 			return nil, err
 		}
-		errChan := make(chan error, 1)
-		go func() {
-			reader := bufio.NewReader(conn)
-			response, err := reader.ReadString('\n')
-			if err != nil {
-				errChan <- err
-				return
-			}
-			if strings.Contains(response, "OK") {
-				errChan <- nil
-			} else {
-				errChan <- fmt.Errorf("hybrid vsock handshake response error: %s", response)
-			}
-		}()
+		// A guest reset can briefly reject CONNECT. Recovery cadence must not be
+		// derived from the 100-second upper timeout (which used to sleep 10s).
+		if os.Getenv("KUASAR_RPC_TIMING") == "1" {
+			log.G(ctx).WithField("retry", retry).Info("fork timing: handshake retry")
+		} else {
+			log.G(ctx).WithField("retry", retry).Debug("hybrid vsock handshake EOF")
+		}
+		timer := time.NewTimer(retry)
 		select {
-		case err = <-errChan:
-			if err != nil {
-				conn.Close()
-				// When it is EOF, maybe the server side is not ready.
-				if err == io.EOF {
-					log.G(context.Background()).Warnf("Read hybrid vsock got EOF, server may not ready")
-					time.Sleep(retryInterval)
-					continue
-				}
-				return nil, err
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		if retry < 100*time.Millisecond {
+			retry *= 2
+			if retry > 100*time.Millisecond {
+				retry = 100 * time.Millisecond
 			}
-			return conn, nil
-		case <-timeoutCh:
-			conn.Close()
-			return nil, fmt.Errorf("timeout waiting for hybrid vsocket handshake of %s:%d", addr, port)
 		}
 	}
-
 }
 
 func dialVsock(address string) (net.Conn, error) {

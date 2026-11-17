@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/containerd/ttrpc"
+	"github.com/containerd/typeurl/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -75,6 +76,7 @@ func (g *wgCloser) Wait() {
 }
 
 func (g *wgCloser) Close() {
+	defer g.cancel()
 	for _, f := range g.set {
 		f.Close()
 	}
@@ -228,35 +230,63 @@ func openStream(ctx context.Context, urlStr string) (streamingapi.Stream, error)
 		return nil, fmt.Errorf("no stream id in url queries")
 	}
 	realAddress := fmt.Sprintf("%s://%s/%s", scheme, u.Host, u.Path)
-	conn, err := shim.AnonReconnectDialer(realAddress, 100*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect the stream %v", err)
-	}
-	var stream streamingapi.Stream
-
 	switch protocol {
 	case "ttrpc":
-		c := ttrpc.NewClient(conn)
-		streamCreator := proxy.NewStreamCreator(c)
-		stream, err = streamCreator.Create(ctx, id)
+		conn, err := shim.AnonReconnectDialerContext(ctx, realAddress, 100*time.Second)
 		if err != nil {
+			return nil, fmt.Errorf("failed to connect the stream %v", err)
+		}
+		c := ttrpc.NewClient(conn)
+		stream, err := proxy.NewStreamCreator(c).Create(ctx, id)
+		if err != nil {
+			c.Close()
 			return nil, err
 		}
-		return stream, nil
-
+		return newOwnedStream(ctx, stream, c), nil
 	case "grpc":
 		gopts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 		conn, err := grpc.NewClient(realAddress, gopts...)
 		if err != nil {
 			return nil, err
 		}
-		streamCreator := proxy.NewStreamCreator(conn)
-		stream, err = streamCreator.Create(ctx, id)
+		stream, err := proxy.NewStreamCreator(conn).Create(ctx, id)
 		if err != nil {
+			conn.Close()
 			return nil, err
 		}
-		return stream, nil
+		return newOwnedStream(ctx, stream, conn), nil
 	default:
 		return nil, fmt.Errorf("protocol not supported")
 	}
+}
+
+// Each stream owns a dedicated client. Close must remain a send-side half-close:
+// queued stdin DATA and EOF must reach the guest before the transport is closed.
+// Release the client on remote EOF/error or cancellation of the IO lifetime.
+type ownedStream struct {
+	streamingapi.Stream
+	release func()
+	stop    func() bool
+	once    sync.Once
+	err     error
+}
+
+func newOwnedStream(ctx context.Context, stream streamingapi.Stream, transport io.Closer) *ownedStream {
+	var once sync.Once
+	release := func() { once.Do(func() { _ = transport.Close() }) }
+	return &ownedStream{Stream: stream, release: release, stop: context.AfterFunc(ctx, release)}
+}
+
+func (s *ownedStream) Recv() (typeurl.Any, error) {
+	value, err := s.Stream.Recv()
+	if err != nil {
+		s.stop()
+		s.release()
+	}
+	return value, err
+}
+
+func (s *ownedStream) Close() error {
+	s.once.Do(func() { s.err = s.Stream.Close() })
+	return s.err
 }
